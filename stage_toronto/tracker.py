@@ -1,14 +1,19 @@
 """
-tracker_hough.py  ―  Détection HoughCircles + filtre de couverture sombre
-=========================================================================
-Pipeline :
-  1. Normalisation du fond (division par Gaussienne 201px) → supprime le zigzag.
-  2. HoughCircles en 3 passes (S/M/L) sur l'image normalisée.
-  3. NMS inter-passes (les grands cercles ont priorité).
-  4. Filtre de couverture sombre : rejette les cercles dont l'intérieur
-     n'est PAS majoritairement sombre.  Élimine les grands faux cercles
-     qui entourent plusieurs gouttes ou épousent le fond.
-  5. Suivi LapTrack + CSV fusions + flash visuel sur les merges.
+tracker_hough.py  —  Tracking de gouttes de condensation
+=========================================================
+Nouveauté clé : masque du zigzag
+  Le patron en zigzag central est détecté automatiquement comme une zone
+  de luminosité locale élevée (GaussianBlur 101px > seuil 95) et exclu
+  de la détection.  Aucune goutte fantôme dans le zigzag.
+
+Pipeline complet :
+  1. Normalisation (division par fond flou 201px)
+  2. Masque zigzag (luminosité locale > 95 → zone exclue)
+  3. HoughCircles 4 passes (maxR ≤ 34px, calibré sur données réelles)
+  4. NMS inter-passes
+  5. Filtre couverture sombre (rejette les cercles autour du fond)
+  6. Vérification finale : le centre du cercle ne doit pas être dans le masque
+  7. LapTrack + CSV fusions + flash visuel
 
 Dépendances :
     pip install opencv-python numpy pandas laptrack
@@ -17,20 +22,16 @@ Usage :
     python tracker_hough.py video.mp4
     python tracker_hough.py video.mp4 --fps-extract 5
 
-Paramètres à ajuster (haut du fichier) :
-    HOUGH_PASSES       → param2 pour contrôler sensibilité / faux positifs
-    MIN_DARK_COVERAGE  → seuil de couverture sombre (0–1)
-    NMS_OVERLAP        → aggressivité de la suppression des doublons
-
-Sorties :
-    <video>_hough.mp4
-    <video>_hough_merges.csv
+Réglages (section PARAMÈTRES ci-dessous) :
+  ZIGZAG_BRIGHTNESS_THRESH  ↑ masque moins de surface  ↓ masque plus
+  param2 dans HOUGH_PASSES  ↑ moins de détections      ↓ plus
+  MIN_COV_*                 ↑ rejette plus de FP
 """
 
 import argparse, csv
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -43,61 +44,62 @@ except ImportError:
     HAS_LAPTRACK = False
     print("⚠  pip install laptrack  pour activer le suivi")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PARAMÈTRES — ajuster ici selon la vidéo
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PARAMÈTRES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Normalisation du fond
-BG_KERNEL = 201          # doit être > diamètre max des gouttes (px, pleine résolution)
+BG_KERNEL = 201          # normalisation fond (px)
 
-# HoughCircles — 3 passes sur IMAGE PLEINE RÉSOLUTION
-# Colonnes : blur_k  dp   minDist  param1  param2  minR  maxR  label
-# ↑ param2 = moins de cercles (moins de FP) ; ↓ param2 = plus de cercles
+# Masque zigzag
+ZIGZAG_LOCAL_KERNEL   = 101   # taille du flou pour détecter la luminosité locale
+ZIGZAG_BRIGHTNESS_THRESH = 95 # seuil : local_mean > valeur → zone zigzag
+ZIGZAG_CLOSE_KERNEL   = 60    # fermeture morphologique pour remplir les trous
+ZIGZAG_OPEN_KERNEL    = 20    # ouverture pour supprimer les petites taches
+
+# 4 passes HoughCircles — PLEINE RÉSOLUTION
+# (blur_k, dp, minDist, param1, param2, minR, maxR)
+# maxR = 34px → calibré sur données réelles (p99 = 33px)
 HOUGH_PASSES = [
-    (  9, 1.2,   18,   60,   20,    5,   22,  "S"),
-    ( 13, 1.2,   32,   62,   22,   18,   44,  "M"),
-    ( 21, 1.3,   64,   65,   26,   36,   64,  "L"),
+    ( 5, 1.2,   6,  60,  16,   4,   9),
+    ( 7, 1.2,  10,  60,  18,   7,  16),
+    (11, 1.2,  16,  60,  22,  13,  24),
+    (15, 1.2,  22,  60,  26,  20,  34),
 ]
 
-# Suppression des doublons inter-passes
-NMS_OVERLAP = 0.45       # 0 = pas de suppression, 0.5 = standard
-
-# Filtre de couverture sombre : un vrai cercle de goutte doit avoir
-# son intérieur majoritairement sombre (corps de la goutte).
-# Les grands faux cercles (plusieurs gouttes à l'intérieur) ont peu de surface sombre.
-DARK_THRESHOLD      = 108   # valeur en dessous = "sombre" (sur image normalisée 0-255)
-MIN_DARK_COVERAGE   = 0.32  # petits cercles  (< LARGE_R_THRESH px)
-MIN_DARK_COVERAGE_L = 0.42  # grands cercles  (≥ LARGE_R_THRESH px)
-LARGE_R_THRESH      = 36    # px pleine résolution
+NMS_OVERLAP       = 0.40
+DARK_THRESHOLD    = 108
+MIN_COV_SMALL     = 0.28   # r < LARGE_R_THRESH
+MIN_COV_LARGE     = 0.40   # r ≥ LARGE_R_THRESH
+LARGE_R_THRESH    = 20
 
 # LapTrack
-RADIUS_LARGE_LAP = 36
+RADIUS_LARGE_LAP = 20
 LAP_LARGE = dict(
-    track_dist_metric="sqeuclidean", track_cost_cutoff=20000,
-    gap_closing_dist_metric="sqeuclidean", gap_closing_cost_cutoff=1800,
+    track_dist_metric="sqeuclidean", track_cost_cutoff=15000,
+    gap_closing_dist_metric="sqeuclidean", gap_closing_cost_cutoff=1200,
     gap_closing_max_frame_count=3,
-    merging_dist_metric="sqeuclidean", merging_cost_cutoff=900,
+    merging_dist_metric="sqeuclidean", merging_cost_cutoff=700,
 )
 LAP_SMALL = dict(
-    track_dist_metric="sqeuclidean", track_cost_cutoff=1200,
-    gap_closing_dist_metric="sqeuclidean", gap_closing_cost_cutoff=1200,
+    track_dist_metric="sqeuclidean", track_cost_cutoff=800,
+    gap_closing_dist_metric="sqeuclidean", gap_closing_cost_cutoff=800,
     gap_closing_max_frame_count=2,
 )
 
 TRAIL_LEN       = 30
 MERGE_FLASH_LEN = 14
 MERGE_LOG_ROWS  = 6
+
 SIZE_CATS = [
-    (64, "XL", (0,   0, 220)),
-    (36, "L",  (0, 100, 255)),
-    (18, "M",  (0, 200, 180)),
-    ( 0, "S",  (150, 220, 0)),
+    (28, "L",  (0,  80, 220)),
+    (16, "M",  (0, 190, 160)),
+    ( 0, "S",  (140, 210,  0)),
 ]
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  UTILITAIRES
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def make_color(seed: int) -> Tuple[int,int,int]:
     rng = np.random.default_rng(seed * 6364136223846793005 & 0xFFFFFFFF)
@@ -109,58 +111,67 @@ def make_color(seed: int) -> Tuple[int,int,int]:
 def size_label(r: float) -> Tuple[str, Tuple]:
     for thr,lab,col in SIZE_CATS:
         if r >= thr: return lab, col
-    return "S", (150,220,0)
+    return "S", (140,210,0)
 
 
 def normalize_frame(gray: np.ndarray) -> np.ndarray:
-    """Division par fond flou → élimine le gradient d'éclairage (zigzag)."""
     k = BG_KERNEL if BG_KERNEL%2==1 else BG_KERNEL+1
     bg = cv2.GaussianBlur(gray.astype(np.float32),(k,k),0)
     return np.clip(gray.astype(np.float32)/(bg+1e-6)*128, 0, 255).astype(np.uint8)
 
 
+def make_zigzag_mask(gray: np.ndarray) -> np.ndarray:
+    """
+    Retourne un masque binaire uint8 :  1 = zone zigzag (exclure),  0 = zone gouttes.
+    Méthode : luminosité locale (GaussianBlur 101px) > seuil → zigzag.
+    Nettoyage morphologique pour éviter d'exclure les reflets des grosses gouttes.
+    """
+    lm = cv2.GaussianBlur(gray.astype(np.float32),
+                           (ZIGZAG_LOCAL_KERNEL, ZIGZAG_LOCAL_KERNEL), 0)
+    bright = (lm > ZIGZAG_BRIGHTNESS_THRESH).astype(np.uint8)
+    k_c = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                     (ZIGZAG_CLOSE_KERNEL, ZIGZAG_CLOSE_KERNEL))
+    k_o = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                     (ZIGZAG_OPEN_KERNEL,  ZIGZAG_OPEN_KERNEL))
+    closed = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, k_c)
+    return cv2.morphologyEx(closed, cv2.MORPH_OPEN, k_o)
+
+
 def dark_coverage(norm: np.ndarray, cx: float, cy: float, r: float) -> float:
-    """
-    Fraction de pixels SOMBRES à l'intérieur du cercle (rayon réduit à 75 %).
-    Valeur haute → vrai cercle de goutte (corps sombre).
-    Valeur basse → faux cercle autour de plusieurs gouttes (fond clair entre elles).
-    """
-    inner_r = max(1, int(r * 0.75))
+    inner = max(1, int(r * 0.80))
     mask = np.zeros(norm.shape, np.uint8)
-    cv2.circle(mask,(int(cx),int(cy)),inner_r,255,-1)
-    inside = norm[mask>0]
-    if len(inside) == 0:
-        return 0.0
+    cv2.circle(mask, (int(cx),int(cy)), inner, 255, -1)
+    inside = norm[mask > 0]
+    if len(inside) == 0: return 0.0
     return float((inside < DARK_THRESHOLD).sum()) / len(inside)
 
 
 def nms(circles: List[Tuple], overlap: float = NMS_OVERLAP) -> List[Tuple]:
-    """Non-Maximum Suppression. Grands cercles prioritaires."""
     kept: List[Tuple] = []
     for c in sorted(circles, key=lambda x: -x[2]):
         cx,cy,cr = c[:3]
-        if not any(
-            ((cx-kx)**2+(cy-ky)**2)**0.5 < (cr+kr)*overlap
-            for kx,ky,kr in kept
-        ):
+        if not any(((cx-kx)**2+(cy-ky)**2)**0.5 < (cr+kr)*overlap
+                   for kx,ky,kr in kept):
             kept.append((cx,cy,cr))
     return kept
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  DÉTECTION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def detect_circles(gray: np.ndarray) -> List[Tuple[float,float,float]]:
-    """
-    Retourne [(x, y, r), …] en pixels (même résolution que gray).
-    Applique : normalisation → Hough 3 passes → NMS → filtre couverture sombre.
-    """
-    norm = normalize_frame(gray)
-    raw: List[Tuple] = []
+    """Retourne [(x, y, r), …] en pixels pleine résolution, zigzag exclu."""
+    norm     = normalize_frame(gray)
+    mask_zz  = make_zigzag_mask(gray)
 
-    for blur_k,dp,minD,p1,p2,minR,maxR,_lab in HOUGH_PASSES:
-        b = cv2.GaussianBlur(norm,(blur_k,blur_k),0)
+    # Remplacer la zone zigzag par du gris uniforme → plus de gradient → Hough aveugle
+    norm_m = norm.copy()
+    norm_m[mask_zz == 1] = 128
+
+    raw: List[Tuple] = []
+    for blur_k,dp,minD,p1,p2,minR,maxR in HOUGH_PASSES:
+        b = cv2.GaussianBlur(norm_m,(blur_k,blur_k),0)
         c = cv2.HoughCircles(b, cv2.HOUGH_GRADIENT, dp=dp, minDist=minD,
                               param1=p1, param2=p2,
                               minRadius=minR, maxRadius=maxR)
@@ -169,32 +180,32 @@ def detect_circles(gray: np.ndarray) -> List[Tuple[float,float,float]]:
 
     deduped = nms(raw)
 
-    # Filtre couverture sombre : rejette les faux grands cercles
-    filtered = []
-    for cx,cy,cr in deduped:
-        cov = dark_coverage(norm, cx, cy, cr)
-        min_cov = MIN_DARK_COVERAGE_L if cr >= LARGE_R_THRESH else MIN_DARK_COVERAGE
-        if cov >= min_cov:
-            filtered.append((cx, cy, cr))
-
-    return filtered
+    return [
+        (cx,cy,cr) for cx,cy,cr in deduped
+        # Filtre 1 : couverture sombre
+        if dark_coverage(norm, cx, cy, cr) >= (
+            MIN_COV_LARGE if cr >= LARGE_R_THRESH else MIN_COV_SMALL)
+        # Filtre 2 : le centre du cercle ne doit pas être dans le zigzag
+        and mask_zz[min(int(cy), gray.shape[0]-1),
+                    min(int(cx), gray.shape[1]-1)] == 0
+    ]
 
 
 def detect_all(frames: List[np.ndarray]) -> pd.DataFrame:
     print(f"Détection sur {len(frames)} frames…")
     rows = []
     for i,f in enumerate(frames):
-        for x,y,r in detect_circles(f):
+        circles = detect_circles(f)
+        for x,y,r in circles:
             rows.append({"frame":i,"x":x,"y":y,"r":r})
         if (i+1)%10==0 or i==len(frames)-1:
-            n = sum(1 for row in rows if row["frame"]==i)
-            print(f"  {i+1}/{len(frames)} — {n} gouttes")
+            print(f"  {i+1}/{len(frames)} — {len(circles)} gouttes")
     return pd.DataFrame(rows)
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TRACKING
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run_tracking(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if not HAS_LAPTRACK:
@@ -208,8 +219,7 @@ def run_tracking(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         sub = df[mask].copy().reset_index(drop=True)
         if len(sub)==0: continue
         lt = LapTrack(**params)
-        tr, _, mg = lt.predict_dataframe(sub, coordinate_cols=["x","y"],
-                                          frame_col="frame")
+        tr, _, mg = lt.predict_dataframe(sub, coordinate_cols=["x","y"], frame_col="frame")
         tr = tr.copy(); tr["track_id"] += offset
         offset = int(tr["track_id"].max())+1
         parts.append(tr)
@@ -217,7 +227,7 @@ def run_tracking(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
             mg = mg.copy()
             for col in mg.columns:
                 if "track_id" in col.lower():
-                    mg[col] += offset - int(tr["track_id"].max()) - 1
+                    mg[col] += offset-int(tr["track_id"].max())-1
             merges.append(mg)
 
     track_df = pd.concat(parts,  ignore_index=True) if parts  else pd.DataFrame()
@@ -225,9 +235,9 @@ def run_tracking(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return track_df, merge_df
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CSV FUSIONS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def save_merges_csv(merge_df, track_df, stem, efps):
     if merge_df.empty: return
@@ -243,7 +253,7 @@ def save_merges_csv(merge_df, track_df, stem, efps):
         rows.append({"frame":fr,"time_s":f"{fr/max(efps,1e-6):.2f}",
                      "track_absorbe":pa,"track_disparu":ch,
                      "x":f"{x:.0f}","y":f"{y:.0f}","rayon_px":f"{r:.1f}"})
-    p = stem.parent/f"{stem.stem}_merges.csv"
+    p=stem.parent/f"{stem.stem}_merges.csv"
     with open(p,"w",newline="",encoding="utf-8") as f:
         w=csv.DictWriter(f,fieldnames=list(rows[0].keys()))
         w.writeheader(); w.writerows(rows)
@@ -264,31 +274,29 @@ def build_merge_idx(merge_df, track_df):
     return idx
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  RENDU
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def draw_star(img, cx, cy, r, color, t=2):
+def draw_star(img,cx,cy,r,color,t=2):
     for deg in range(0,360,60):
         a=np.radians(deg)
-        cv2.line(img,(cx,cy),(int(cx+r*np.cos(a)),int(cy+r*np.sin(a))),
-                 color,t,cv2.LINE_AA)
+        cv2.line(img,(cx,cy),(int(cx+r*np.cos(a)),int(cy+r*np.sin(a))),color,t,cv2.LINE_AA)
 
 
 def render(frames, track_df, merge_idx):
     print("Rendu…")
     results=[]
-    trails   = defaultdict(lambda: deque(maxlen=TRAIL_LEN))
-    colors   = {int(p): make_color(int(p)) for p in track_df["track_id"].unique()}
-    actives  = []
-    mlog     = deque(maxlen=MERGE_LOG_ROWS)
-    n        = len(frames)
+    trails  = defaultdict(lambda: deque(maxlen=TRAIL_LEN))
+    colors  = {int(p): make_color(int(p)) for p in track_df["track_id"].unique()}
+    actives = []
+    mlog    = deque(maxlen=MERGE_LOG_ROWS)
+    n       = len(frames)
 
     for i,frame in enumerate(frames):
         out = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         fd  = track_df[track_df["frame"]==i]
 
-        # Traînées
         for _,row in fd.iterrows():
             trails[int(row["track_id"])].append((int(row["x"]),int(row["y"])))
         for pid,trail in trails.items():
@@ -298,22 +306,20 @@ def render(frames, track_df, merge_idx):
                 a=k/len(pts)
                 cv2.line(out,pts[k-1],pts[k],tuple(int(v*a) for v in col),1)
 
-        # Cercles
         for _,row in fd.iterrows():
             pid=int(row["track_id"])
             cx,cy=int(row["x"]),int(row["y"])
             r=max(int(row.get("r",8)),4)
             col=colors.get(pid,(180,180,180))
             lab,_=size_label(float(row.get("r",0)))
-            thick=3 if lab in("XL","L") else 2
+            thick=2 if lab=="L" else 1
             cv2.circle(out,(cx,cy),r,col,thick,cv2.LINE_AA)
-            arm=max(3,r//5)
+            arm=max(2,r//5)
             cv2.line(out,(cx-arm,cy),(cx+arm,cy),col,1,cv2.LINE_AA)
             cv2.line(out,(cx,cy-arm),(cx,cy+arm),col,1,cv2.LINE_AA)
-            cv2.putText(out,f"{pid}[{lab}]",(cx+r+2,cy-2),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.30,(255,255,255),1,cv2.LINE_AA)
+            cv2.putText(out,f"{pid}[{lab}]",(cx+r+2,cy),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.28,(255,255,255),1,cv2.LINE_AA)
 
-        # Fusions
         if i in merge_idx:
             for ev in merge_idx[i]:
                 pa,ch=ev["parent"],ev["child"]
@@ -349,9 +355,9 @@ def render(frames, track_df, merge_idx):
     return results
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  VIDÉO
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def load_frames(path, fps_extract=2.0):
     cap=cv2.VideoCapture(str(path))
@@ -378,9 +384,9 @@ def save_video(frames, path, fps=10.0):
     out.release()
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  PIPELINE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run(video_path: Path, fps_extract: float):
     frames, src_fps, src_dur = load_frames(video_path, fps_extract)
@@ -406,9 +412,8 @@ def run(video_path: Path, fps_extract: float):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
-        description="Tracker de gouttes de condensation — HoughCircles + filtre couverture")
+        description="Tracker gouttes — HoughCircles + masque zigzag + filtre couverture")
     p.add_argument("video", type=Path)
-    p.add_argument("--fps-extract", type=float, default=2.0,
-                   help="Frames/s à extraire (défaut 2)")
+    p.add_argument("--fps-extract", type=float, default=2.0)
     args = p.parse_args()
     run(args.video, args.fps_extract)

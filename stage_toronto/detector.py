@@ -3,18 +3,79 @@ import numpy as np
 import time
 
 
-# --- 1. LE MOTEUR DE DÉTECTION (Notre version Ultime) ---
-def traiter_frame(frame):
-    # La frame arrive en couleur (BGR), on la passe en niveaux de gris pour l'analyse
-    image_grise = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    h, w = image_grise.shape
+# --- 1. LE MOTEUR DE TRACKING ---
+class SuiviGouttes:
+    # ATTENTION : La distance max passe de 20 à 150 pour autoriser les grands sauts d'une seconde à l'autre
+    def __init__(self, distance_max=150):
+        self.prochain_id = 0
+        self.objets = {}
+        self.couleurs = {}
+        self.distance_max = distance_max
 
-    # Prétraitement
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(16, 16))
+    def enregistrer(self, centre):
+        self.objets[self.prochain_id] = centre
+        self.couleurs[self.prochain_id] = (
+            int(np.random.randint(50, 255)),
+            int(np.random.randint(50, 255)),
+            int(np.random.randint(50, 255))
+        )
+        self.prochain_id += 1
+
+    def mettre_a_jour(self, centres_detectes):
+        if len(centres_detectes) == 0:
+            self.objets.clear()
+            self.couleurs.clear()
+            return self.objets
+
+        if len(self.objets) == 0:
+            for i in range(len(centres_detectes)):
+                self.enregistrer(centres_detectes[i])
+        else:
+            ids_objets = list(self.objets.keys())
+            centres_objets = list(self.objets.values())
+
+            D = np.linalg.norm(np.array(centres_objets)[:, np.newaxis] - np.array(centres_detectes), axis=2)
+
+            lignes = D.min(axis=1).argsort()
+            colonnes = D.argmin(axis=1)[lignes]
+
+            lignes_utilisees = set()
+            colonnes_utilisees = set()
+
+            for ligne, colonne in zip(lignes, colonnes):
+                if ligne in lignes_utilisees or colonne in colonnes_utilisees:
+                    continue
+
+                if D[ligne, colonne] > self.distance_max:
+                    continue
+
+                id_objet = ids_objets[ligne]
+                self.objets[id_objet] = centres_detectes[colonne]
+
+                lignes_utilisees.add(ligne)
+                colonnes_utilisees.add(colonne)
+
+            lignes_non_utilisees = set(range(D.shape[0])).difference(lignes_utilisees)
+            for ligne in lignes_non_utilisees:
+                id_objet = ids_objets[ligne]
+                del self.objets[id_objet]
+                del self.couleurs[id_objet]
+
+            colonnes_non_utilisees = set(range(D.shape[1])).difference(colonnes_utilisees)
+            for colonne in colonnes_non_utilisees:
+                self.enregistrer(centres_detectes[colonne])
+
+        return self.objets
+
+
+# --- 2. LE MOTEUR DE DÉTECTION ULTIME ---
+def extraire_centres(frame, w):
+    image_grise = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
     img_clahe = clahe.apply(image_grise)
     blur = cv2.medianBlur(img_clahe, 5)
 
-    # Binarisation Sévère
     thresh = cv2.adaptiveThreshold(
         blur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -22,17 +83,14 @@ def traiter_frame(frame):
         55, 8
     )
 
-    # Nettoyage Morphologique
     kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     morph = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open, iterations=1)
 
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     morph = cv2.morphologyEx(morph, cv2.MORPH_CLOSE, kernel_close, iterations=2)
 
-    # Transformée de Distance
     dist_transform = cv2.distanceTransform(morph, cv2.DIST_L2, 5)
 
-    # Filtre Anti-Doublons (Cercle 17x17)
     kernel_nms = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
     dist_dilated = cv2.dilate(dist_transform, kernel_nms)
 
@@ -41,82 +99,90 @@ def traiter_frame(frame):
 
     y_coords, x_coords = np.where(pics)
 
-    # Limites (à ajuster si la caméra bouge dans la vidéo)
     limite_gauche = int(w * 0.38)
     limite_droite = int(w * 0.85)
 
-    # On dessine directement sur la frame originale en couleur
+    centres_valides = []
+
     for y, x in zip(y_coords, x_coords):
         if x < limite_gauche or x > limite_droite:
             rayon_estime = dist_transform[y, x]
-
             if 15 < rayon_estime < 40:
-                cv2.drawMarker(
-                    frame,
-                    (x, y),
-                    color=(0, 0, 255),
-                    markerType=cv2.MARKER_CROSS,
-                    markerSize=20,
-                    thickness=3
-                )
+                centres_valides.append((int(x), int(y)))
 
-    return frame
+    return centres_valides
 
 
-# --- 2. LE GESTIONNAIRE DE VIDÉO ---
-def analyser_video(chemin_entree, chemin_sortie):
-    # Ouvrir la vidéo source
+# --- 3. LE GESTIONNAIRE DE VIDÉO (MODIFIÉ 1 FPS) ---
+def analyser_video_1fps(chemin_entree, chemin_sortie):
     cap = cv2.VideoCapture(chemin_entree)
 
     if not cap.isOpened():
         print(f"Erreur : Impossible d'ouvrir la vidéo {chemin_entree}")
         return
 
-    # Récupérer les caractéristiques de la vidéo source
     largeur = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     hauteur = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    fps_source = int(cap.get(cv2.CAP_PROP_FPS))
     nombre_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    print(f"--- DÉBUT DE L'ANALYSE ---")
-    print(f"Résolution : {largeur}x{hauteur}")
-    print(f"Framerate : {fps} FPS")
-    print(f"Total des frames à traiter : {nombre_total_frames}")
+    print(f"--- DÉBUT DU TRACKING (MODE 1 FPS) ---")
+    print(f"Vidéo source : {fps_source} FPS")
+    print(f"La vidéo finale sera un diaporama à 1 FPS.")
 
-    # Préparer le fichier de sortie (Format MP4)
+    # La vidéo de sortie est forcée à 1 image par seconde
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(chemin_sortie, fourcc, fps, (largeur, hauteur))
+    out = cv2.VideoWriter(chemin_sortie, fourcc, 1, (largeur, hauteur))
+
+    tracker = SuiviGouttes(distance_max=150)
 
     temps_debut = time.time()
-    frames_traitees = 0
 
-    # Boucle de lecture frame par frame
-    while True:
+    # On commence à la frame 0
+    frame_index = 0
+    images_generees = 0
+
+    while frame_index < nombre_total_frames:
+        # L'astuce magique : On ordonne au lecteur de "sauter" directement à la frame ciblée
+        # Cela évite à votre processeur de lire inutilement les 59 frames intermédiaires
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         ret, frame = cap.read()
 
-        # Si 'ret' est False, la vidéo est terminée
         if not ret:
             break
 
-        # 1. Analyser la frame et dessiner les croix
-        frame_annotee = traiter_frame(frame)
+        # Traitement
+        centres_actuels = extraire_centres(frame, largeur)
+        objets_suivis = tracker.mettre_a_jour(centres_actuels)
 
-        # 2. Écrire la frame dans la nouvelle vidéo
-        out.write(frame_annotee)
+        # Dessin
+        for id_objet, centre in objets_suivis.items():
+            couleur_specifique = tracker.couleurs[id_objet]
+            cv2.drawMarker(
+                frame,
+                centre,
+                color=couleur_specifique,
+                markerType=cv2.MARKER_CROSS,
+                markerSize=20,
+                thickness=3
+            )
 
-        # 3. Afficher l'avancement dans la console
-        frames_traitees += 1
-        if frames_traitees % 60 == 0:  # Mise à jour toutes les 60 frames (1 seconde de vidéo)
-            print(f"Progression : {frames_traitees}/{nombre_total_frames} frames traitées...")
+        # Écriture dans le fichier final
+        out.write(frame)
 
-    # Libérer la mémoire et fermer les fichiers
+        images_generees += 1
+        print(f"Seconde {images_generees} analysée...")
+
+        # On avance le "curseur" de l'équivalent du framerate (ex: on passe de la frame 0 à 60, puis 120...)
+        frame_index += fps_source
+
     cap.release()
     out.release()
 
     temps_total = time.time() - temps_debut
-    print(f"--- TERMINÉ ! ---")
+    print(f"--- TRACKING TERMINÉ ! ---")
     print(f"Vidéo sauvegardée sous : {chemin_sortie}")
-    print(f"Temps de traitement : {temps_total:.2f} secondes.")
+    print(f"Temps de calcul : {temps_total:.2f} secondes.")
 
-# Lancement du code (remplacez par vos noms de fichiers)
-analyser_video('Video1_1.mp4', 'Video1_1_cross.mp4')
+#Lancement du code (remplacez par vos noms de fichiers)
+analyser_video_1fps('Video1_1.mp4', 'Video1_1_cross.mp4')
