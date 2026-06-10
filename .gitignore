@@ -1,0 +1,19 @@
+# Claude Code
+.claude/
+
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+DEBUG_*
+
+# OS
+Thumbs.db
+.DS_Store
