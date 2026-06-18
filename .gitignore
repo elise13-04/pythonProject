@@ -17,3 +17,5 @@ DEBUG_*
 # OS
 Thumbs.db
 .DS_Store
+
+/tiffs_all

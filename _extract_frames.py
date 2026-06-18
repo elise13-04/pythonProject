@@ -1,6 +1,6 @@
 import cv2, os
 
-os.makedirs("_frames", exist_ok=True)
+os.makedirs("frames", exist_ok=True)
 for vid in ["Video1_1.mp4", "Video1_2.mp4", "Video1_3.mp4", "Video1_4.mp4", "Video1_5.mp4"]:
     p = os.path.join("stage_toronto", vid)
     cap = cv2.VideoCapture(p)
@@ -13,6 +13,6 @@ for vid in ["Video1_1.mp4", "Video1_2.mp4", "Video1_3.mp4", "Video1_4.mp4", "Vid
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(n * frac))
         ret, f = cap.read()
         if ret:
-            cv2.imwrite(os.path.join("_frames", vid.replace(".mp4", "") + "_" + tag + ".png"), f)
+            cv2.imwrite(os.path.join("frames", vid.replace(".mp4", "") + "_" + tag + ".png"), f)
     cap.release()
 print("done")
